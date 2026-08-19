@@ -50,9 +50,9 @@ describe("Compliance", function () {
 
   describe("blocklist", function () {
     it("blocks per token and lifts again, without touching other tokens", async function () {
-      const { compliance, ops, officer, token, otherToken, alice, bob } = await deployFixture();
+      const { compliance, officer, token, otherToken, alice, bob } = await deployFixture();
 
-      await expect(compliance.connect(ops).setBlocked(token, [alice.address], true))
+      await expect(compliance.connect(officer).setBlocked(token, [alice.address], true))
         .to.emit(compliance, "BlocklistUpdated")
         .withArgs(token, [alice.address], true);
 
@@ -64,9 +64,6 @@ describe("Compliance", function () {
       await compliance.checkIsCompliant(otherToken, alice.address);
       await compliance.checkIsCompliant(token, bob.address);
 
-      await expect(compliance.connect(ops).setBlocked(token, [alice.address], false))
-        .to.be.revertedWithCustomError(compliance, "UnauthorizedComplianceOperator")
-        .withArgs(ops.address);
       await compliance.connect(officer).setBlocked(token, [alice.address], false);
       await compliance.checkIsCompliant(token, alice.address);
     });
@@ -87,14 +84,14 @@ describe("Compliance", function () {
     });
 
     it("refuses an empty batch and the zero address", async function () {
-      const { compliance, ops, token } = await deployFixture();
+      const { compliance, officer, token } = await deployFixture();
 
-      await expect(compliance.connect(ops).setBlocked(token, [], true)).to.be.revertedWithCustomError(
+      await expect(compliance.connect(officer).setBlocked(token, [], true)).to.be.revertedWithCustomError(
         compliance,
         "EmptyAccounts",
       );
       await expect(
-        compliance.connect(ops).setBlocked(token, [ethers.ZeroAddress], true),
+        compliance.connect(officer).setBlocked(token, [ethers.ZeroAddress], true),
       ).to.be.revertedWithCustomError(compliance, "ZeroAddress");
     });
   });
@@ -144,7 +141,7 @@ describe("Compliance", function () {
       const { compliance, officer, alice, bob } = await deployFixture();
       await compliance.connect(officer).addSanctions([alice.address]);
 
-      await expect(compliance.connect(officer).setSanctions([bob.address, bob.address]))
+      await expect(compliance.connect(officer).replaceSanctions(1, [bob.address, bob.address]))
         .to.emit(compliance, "SanctionsReset")
         .withArgs(2)
         .and.to.emit(compliance, "SanctionsAdded")
@@ -155,11 +152,22 @@ describe("Compliance", function () {
       expect(await compliance.isSanctioned(alice.address)).to.equal(false);
       expect(await compliance.isSanctioned(bob.address)).to.equal(true);
 
-      await expect(compliance.connect(officer).setSanctions([])).to.be.revertedWithCustomError(
+      await expect(compliance.connect(officer).replaceSanctions(2, [])).to.be.revertedWithCustomError(
         compliance,
         "EmptyAccounts",
       );
       expect(await compliance.isSanctioned(bob.address)).to.equal(true);
+    });
+
+    it("rejects a second replacement built from a stale epoch", async function () {
+      const { compliance, officer, alice, bob } = await deployFixture();
+      await compliance.connect(officer).replaceSanctions(1, [alice.address]);
+
+      await expect(compliance.connect(officer).replaceSanctions(1, [bob.address]))
+        .to.be.revertedWithCustomError(compliance, "UnexpectedSanctionEpoch")
+        .withArgs(1, 2);
+      expect(await compliance.isSanctioned(alice.address)).to.equal(true);
+      expect(await compliance.isSanctioned(bob.address)).to.equal(false);
     });
 
     it("survives a stale entry from an earlier epoch", async function () {
@@ -251,6 +259,18 @@ describe("Compliance", function () {
         compliance.connect(ops).setFreeze(token, ethers.ZeroAddress, (await time.latest()) + 60),
       ).to.be.revertedWithCustomError(compliance, "ZeroAddress");
     });
+
+    it("bounds token-operator freezes while officers may set longer periods", async function () {
+      const { compliance, ops, officer, token, alice } = await deployFixture();
+      const maximumUntil = BigInt(await time.latest()) + await compliance.MAX_OPS_FREEZE_DURATION();
+
+      await compliance.connect(ops).setFreeze(token, alice.address, maximumUntil);
+      const nextMaximum = BigInt(await time.latest()) + await compliance.MAX_OPS_FREEZE_DURATION();
+      await expect(compliance.connect(ops).setFreeze(token, alice.address, nextMaximum + 60n))
+        .to.be.revertedWithCustomError(compliance, "FreezeTooLong");
+
+      await compliance.connect(officer).setFreeze(token, alice.address, nextMaximum + 30n * 24n * 3600n);
+    });
   });
 
   describe("transfer checks", function () {
@@ -259,7 +279,7 @@ describe("Compliance", function () {
 
       await compliance.checkTransfer(token, ethers.ZeroAddress, ethers.ZeroAddress, ethers.ZeroAddress, 1);
 
-      await compliance.connect(ops).setBlocked(token, [outsider.address], true);
+      await compliance.connect(officer).setBlocked(token, [outsider.address], true);
       await expect(compliance.checkTransfer(token, outsider.address, alice.address, bob.address, 1))
         .to.be.revertedWithCustomError(compliance, "UserBlocked")
         .withArgs(outsider.address);
@@ -279,7 +299,7 @@ describe("Compliance", function () {
     });
 
     it("deduplicates participants that occupy more than one transfer role", async function () {
-      const { compliance, ops, outsider, token, alice, bob } = await deployFixture();
+      const { compliance, officer, outsider, token, alice, bob } = await deployFixture();
 
       const dedupedGas = await compliance.checkTransfer.estimateGas(
         token,
@@ -297,7 +317,7 @@ describe("Compliance", function () {
       );
       expect(dedupedGas).to.be.lessThan(distinctGas);
 
-      await compliance.connect(ops).setBlocked(token, [alice.address], true);
+      await compliance.connect(officer).setBlocked(token, [alice.address], true);
       await expect(compliance.checkTransfer(token, alice.address, alice.address, alice.address, 1))
         .to.be.revertedWithCustomError(compliance, "UserBlocked")
         .withArgs(alice.address);
@@ -311,7 +331,7 @@ describe("Compliance", function () {
       // isCompliant duplicates checkIsCompliant's decision without reverting, so
       // every reason it can refuse for is exercised here — a divergence between
       // the two would let a UI offer a transfer the token then rejects.
-      await compliance.connect(ops).setBlocked(token, [alice.address], true);
+      await compliance.connect(officer).setBlocked(token, [alice.address], true);
       expect(await compliance.isCompliant(token, alice.address)).to.equal(false);
       await compliance.connect(officer).setBlocked(token, [alice.address], false);
 
@@ -340,16 +360,16 @@ describe("Compliance", function () {
 
   describe("input validation on every list", function () {
     it("refuses an empty batch wherever one is required", async function () {
-      const { compliance, ops, officer, token } = await deployFixture();
+      const { compliance, officer, token } = await deployFixture();
 
       // Thunks rather than an array of live promises: building the array would
       // fire every call at once and leave the later rejections unhandled until
       // the loop got round to awaiting them.
       for (const call of [
-        () => compliance.connect(ops).setBlocked(token, [], true),
+        () => compliance.connect(officer).setBlocked(token, [], true),
         () => compliance.connect(officer).addSanctions([]),
         () => compliance.connect(officer).removeSanctions([]),
-        () => compliance.connect(officer).setSanctions([]),
+        () => compliance.connect(officer).replaceSanctions(1, []),
       ]) {
         await expect(call()).to.be.revertedWithCustomError(compliance, "EmptyAccounts");
       }
@@ -361,10 +381,10 @@ describe("Compliance", function () {
 
       const freezeUntil = (await time.latest()) + 60;
       for (const call of [
-        () => compliance.connect(ops).setBlocked(token, [zero], true),
+        () => compliance.connect(officer).setBlocked(token, [zero], true),
         () => compliance.connect(officer).addSanctions([zero]),
         () => compliance.connect(officer).removeSanctions([zero]),
-        () => compliance.connect(officer).setSanctions([zero]),
+        () => compliance.connect(officer).replaceSanctions(1, [zero]),
         () => compliance.connect(ops).setFreeze(token, zero, freezeUntil),
       ]) {
         await expect(call()).to.be.revertedWithCustomError(compliance, "ZeroAddress");
@@ -372,14 +392,14 @@ describe("Compliance", function () {
     });
 
     it("caps every account batch", async function () {
-      const { compliance, ops, officer, token, alice } = await deployFixture();
+      const { compliance, officer, token, alice } = await deployFixture();
       const oversized = Array(201).fill(alice.address);
 
       for (const call of [
-        () => compliance.connect(ops).setBlocked(token, oversized, true),
+        () => compliance.connect(officer).setBlocked(token, oversized, true),
         () => compliance.connect(officer).addSanctions(oversized),
         () => compliance.connect(officer).removeSanctions(oversized),
-        () => compliance.connect(officer).setSanctions(oversized),
+        () => compliance.connect(officer).replaceSanctions(1, oversized),
       ]) {
         await expect(call()).to.be.revertedWithCustomError(compliance, "BatchTooLarge").withArgs(201);
       }
@@ -399,7 +419,7 @@ describe("Compliance", function () {
   });
 
   describe("authority", function () {
-    it("keeps each ops role token-scoped and impose-only", async function () {
+    it("keeps each ops role token-scoped, temporary and freeze-only", async function () {
       const { compliance, ops, otherOps, officer, token, otherToken, alice } = await deployFixture();
       const until = (await time.latest()) + 60;
 
@@ -408,10 +428,10 @@ describe("Compliance", function () {
         compliance,
         "ZeroAddress",
       );
-      await compliance.connect(ops).setBlocked(token, [alice.address], true);
-      await expect(compliance.connect(ops).setBlocked(token, [alice.address], false))
+      await expect(compliance.connect(ops).setBlocked(token, [alice.address], true))
         .to.be.revertedWithCustomError(compliance, "UnauthorizedComplianceOperator")
         .withArgs(ops.address);
+      await compliance.connect(officer).setBlocked(token, [alice.address], true);
       await compliance.connect(officer).setBlocked(token, [alice.address], false);
       await compliance.connect(ops).setFreeze(token, alice.address, until);
       await expect(compliance.connect(ops).setFreeze(token, alice.address, until - 1))
@@ -422,15 +442,15 @@ describe("Compliance", function () {
         .withArgs(ops.address);
       await compliance.connect(ops).setFreeze(token, alice.address, until + 60);
       await compliance.connect(officer).setFreeze(token, alice.address, 0);
-      await compliance.connect(otherOps).setBlocked(otherToken, [alice.address], true);
-      await compliance.connect(officer).setBlocked(otherToken, [alice.address], false);
+      await compliance.connect(otherOps).setFreeze(otherToken, alice.address, until);
+      await compliance.connect(officer).setFreeze(otherToken, alice.address, 0);
 
       for (const call of [
         () => compliance.connect(ops).setBlocked(otherToken, [alice.address], true),
         () => compliance.connect(otherOps).setFreeze(token, alice.address, until),
         () => compliance.connect(ops).addSanctions([alice.address]),
         () => compliance.connect(ops).removeSanctions([alice.address]),
-        () => compliance.connect(ops).setSanctions([alice.address]),
+        () => compliance.connect(ops).replaceSanctions(1, [alice.address]),
         () => compliance.connect(ops).resetSanctions(),
         () => compliance.connect(ops).setBlocked(ethers.ZeroAddress, [alice.address], true),
         () => compliance.connect(ops).setFreeze(ethers.ZeroAddress, alice.address, until),
@@ -449,7 +469,8 @@ describe("Compliance", function () {
         await compliance.connect(operator).setFreeze(ethers.ZeroAddress, alice.address, 0);
         await compliance.connect(operator).addSanctions([alice.address]);
         await compliance.connect(operator).removeSanctions([alice.address]);
-        await compliance.connect(operator).setSanctions([alice.address]);
+        const expectedEpoch = await compliance.sanctionEpoch();
+        await compliance.connect(operator).replaceSanctions(expectedEpoch, [alice.address]);
         await compliance.connect(operator).resetSanctions();
       }
 
@@ -468,8 +489,8 @@ describe("Compliance", function () {
         .to.be.revertedWithCustomError(compliance, "UnauthorizedComplianceOperator")
         .withArgs(outsider.address);
 
-      // OPS remains distinct from an outsider for its scoped operations.
-      await compliance.connect(ops).setBlocked(token, [alice.address], true);
+      // OPS remains distinct from an outsider for its bounded scoped operation.
+      await compliance.connect(ops).setFreeze(token, alice.address, (await time.latest()) + 60);
     });
 
     it("only the admin administers roles", async function () {
@@ -498,13 +519,15 @@ describe("Compliance", function () {
       expect(await compliance.hasRole(await compliance.DEFAULT_ADMIN_ROLE(), admin.address)).to.equal(false);
     });
 
-    it("cannot lose the last default admin in one step", async function () {
+    it("cannot renounce or directly copy the last default admin", async function () {
       const { compliance, admin, outsider } = await deployFixture();
       const role = await compliance.DEFAULT_ADMIN_ROLE();
 
       await expect(compliance.connect(admin).renounceRole(role, admin.address))
         .to.be.revertedWithCustomError(compliance, "AccessControlEnforcedDefaultAdminDelay")
         .withArgs(0);
+      await expect(compliance.connect(admin).beginDefaultAdminTransfer(ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(compliance, "InvalidDefaultAdmin");
       await expect(compliance.connect(admin).revokeRole(role, admin.address)).to.be.revertedWithCustomError(
         compliance,
         "AccessControlEnforcedDefaultAdminRules",

@@ -160,27 +160,33 @@ describe("PipoSecurityToken", function () {
       ] as const) {
         await expect(deployToken({ [key]: ethers.ZeroAddress })).to.be.reverted;
       }
-      const [, admin, policyAuthority, , issuer] = await ethers.getSigners();
-      await expect(deployToken({ burner: issuer.address }))
-        .to.be.revertedWithCustomError(await ethers.getContractFactory("PipoSecurityToken"), "InvalidBurner");
-      await expect(deployToken({ policyAuthority: admin.address }))
-        .to.be.revertedWithCustomError(
-          await ethers.getContractFactory("PipoSecurityToken"),
-          "InvalidPolicyAuthority",
-        );
-      for (const issuanceAuthority of [admin.address, issuer.address, policyAuthority.address]) {
-        await expect(deployToken({ issuanceAuthority }))
-          .to.be.revertedWithCustomError(
-            await ethers.getContractFactory("PipoSecurityToken"),
-            "InvalidIssuanceAuthority",
-          );
+      const [, admin, policyAuthority, , issuer, burner, pauser] = await ethers.getSigners();
+      const factory = await ethers.getContractFactory("PipoSecurityToken");
+      for (const [overrides, error] of [
+        [{ issuer: admin.address }, "InvalidIssuer"],
+        [{ burner: admin.address }, "InvalidBurner"],
+        [{ burner: issuer.address }, "InvalidBurner"],
+        [{ pauser: admin.address }, "InvalidPauser"],
+        [{ pauser: issuer.address }, "InvalidPauser"],
+        [{ pauser: burner.address }, "InvalidPauser"],
+        [{ policyAuthority: admin.address }, "InvalidPolicyAuthority"],
+        [{ policyAuthority: issuer.address }, "InvalidPolicyAuthority"],
+        [{ policyAuthority: burner.address }, "InvalidPolicyAuthority"],
+        [{ policyAuthority: pauser.address }, "InvalidPolicyAuthority"],
+        [{ issuanceAuthority: admin.address }, "InvalidIssuanceAuthority"],
+        [{ issuanceAuthority: issuer.address }, "InvalidIssuanceAuthority"],
+        [{ issuanceAuthority: burner.address }, "InvalidIssuanceAuthority"],
+        [{ issuanceAuthority: pauser.address }, "InvalidIssuanceAuthority"],
+        [{ issuanceAuthority: policyAuthority.address }, "InvalidIssuanceAuthority"],
+      ] as const) {
+        await expect(deployToken(overrides)).to.be.revertedWithCustomError(factory, error);
       }
     });
 
     it("rejects every initial policy except the bundled Compliance runtime", async function () {
       const factory = await ethers.getContractFactory("PipoSecurityToken");
       const legacy = await ethers.deployContract("LegacySelectorFallbackPolicy");
-      const alternate = await ethers.deployContract("MockCompliance");
+      const alternate = await ethers.deployContract("MockCompliance", [(await ethers.getSigners())[2].address]);
       const mismatchedAuthority = await ethers.deployContract("Compliance", [
         (await ethers.getSigners())[8].address,
       ]);
@@ -210,6 +216,12 @@ describe("PipoSecurityToken", function () {
       await time.increaseTo(schedule);
       await token.connect(outsider).acceptDefaultAdminTransfer();
       expect(await token.defaultAdmin()).to.equal(outsider.address);
+    });
+
+    it("cannot schedule loss of the default admin", async function () {
+      const { token, admin } = await deployFixture();
+      await expect(token.connect(admin).beginDefaultAdminTransfer(ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(token, "InvalidDefaultAdmin");
     });
 
     it("does not expose mutable metadata or a reversible mint switch", async function () {
@@ -429,36 +441,33 @@ describe("PipoSecurityToken", function () {
       expect(await token.unpauseAvailableAt()).to.equal(0);
     });
 
-    it("approves an alternate runtime only while paused, then installs it", async function () {
+    it("atomically approves and installs a governed alternate runtime", async function () {
       const { token, policy, admin, policyAuthority, issuanceAuthority, pauser, holder, issuer } =
         await deployFixture();
-      const alternate = (await ethers.deployContract("MockCompliance")) as unknown as MockCompliance;
+      const alternate = (await ethers.deployContract("MockCompliance", [
+        policyAuthority.address,
+      ])) as unknown as MockCompliance;
       const alternateHash = ethers.keccak256(await ethers.provider.getCode(await alternate.getAddress()));
 
-      await expect(token.connect(policyAuthority).setComplianceCodehash(alternateHash))
+      await expect(token.connect(policyAuthority).setCompliance(await alternate.getAddress(), alternateHash))
         .to.be.revertedWithCustomError(token, "ExpectedPause");
       await token.connect(pauser).pause();
-      await expect(token.connect(holder).setComplianceCodehash(alternateHash))
+      await expect(token.connect(holder).setCompliance(await alternate.getAddress(), alternateHash))
         .to.be.revertedWithCustomError(token, "UnauthorizedPolicyAuthority")
         .withArgs(holder.address);
-      await expect(token.connect(admin).setComplianceCodehash(alternateHash))
+      await expect(token.connect(admin).setCompliance(await alternate.getAddress(), alternateHash))
         .to.be.revertedWithCustomError(token, "UnauthorizedPolicyAuthority")
         .withArgs(admin.address);
-      await expect(token.connect(admin).setCompliance(await policy.getAddress()))
-        .to.be.revertedWithCustomError(token, "UnauthorizedPolicyAuthority")
-        .withArgs(admin.address);
-      await expect(token.connect(policyAuthority).setComplianceCodehash(ethers.ZeroHash))
-        .to.be.revertedWithCustomError(token, "InvalidComplianceCodehash");
-
-      await expect(token.connect(policyAuthority).setCompliance(await alternate.getAddress()))
+      await expect(token.connect(policyAuthority).setCompliance(await alternate.getAddress(), ethers.ZeroHash))
         .to.be.revertedWithCustomError(token, "InvalidCompliance");
       const bundledHash = await token.complianceCodehash();
-      await expect(token.connect(policyAuthority).setComplianceCodehash(alternateHash))
+      await expect(token.connect(policyAuthority).setCompliance(await alternate.getAddress(), alternateHash))
         .to.emit(token, "ComplianceCodehashUpdated")
-        .withArgs(bundledHash, alternateHash);
-      await expect(token.connect(policyAuthority).setCompliance(await alternate.getAddress()))
-        .to.emit(token, "ComplianceUpdated")
+        .withArgs(bundledHash, alternateHash)
+        .and.to.emit(token, "ComplianceUpdated")
         .withArgs(await policy.getAddress(), await alternate.getAddress());
+      expect(await token.compliance()).to.equal(await alternate.getAddress());
+      expect(await token.complianceCodehash()).to.equal(alternateHash);
 
       await alternate.setRefuseAll(true, "Alternate active");
       await time.increaseTo(await token.unpauseAvailableAt());
@@ -471,20 +480,59 @@ describe("PipoSecurityToken", function () {
     it("never treats an empty-code account as an approved policy", async function () {
       const { token, policyAuthority, pauser, holder } = await deployFixture();
       await token.connect(pauser).pause();
-      await token.connect(policyAuthority).setComplianceCodehash(ethers.keccak256("0x"));
-      await expect(token.connect(policyAuthority).setCompliance(holder.address))
+      await expect(
+        token.connect(policyAuthority).setCompliance(holder.address, ethers.keccak256("0x")),
+      )
         .to.be.revertedWithCustomError(token, "InvalidCompliance");
     });
 
-    it("cannot unpause while the active policy differs from the approved runtime", async function () {
-      const { token, admin, policyAuthority, pauser } = await deployFixture();
-      const alternate = await ethers.deployContract("MockCompliance");
-      const alternateHash = ethers.keccak256(await ethers.provider.getCode(await alternate.getAddress()));
+    it("rejects a codehash-approved contract without policy governance", async function () {
+      const { token, policyAuthority, pauser } = await deployFixture();
+      const malformed = await ethers.deployContract("LegacySelectorFallbackPolicy");
+      const malformedHash = ethers.keccak256(await ethers.provider.getCode(await malformed.getAddress()));
       await token.connect(pauser).pause();
-      await token.connect(policyAuthority).setComplianceCodehash(alternateHash);
-      await time.increaseTo(await token.unpauseAvailableAt());
-      await expect(token.connect(admin).unpause())
+      await expect(token.connect(policyAuthority).setCompliance(await malformed.getAddress(), malformedHash))
         .to.be.revertedWithCustomError(token, "InvalidCompliance");
+    });
+
+    it("rejects a no-op policy update instead of extending the cooldown", async function () {
+      const { token, policy, policyAuthority, pauser } = await deployFixture();
+      await token.connect(pauser).pause();
+      const availableAt = await token.unpauseAvailableAt();
+      await expect(
+        token.connect(policyAuthority).setCompliance(
+          await policy.getAddress(),
+          await token.complianceCodehash(),
+        ),
+      ).to.be.revertedWithCustomError(token, "ComplianceUnchanged");
+      expect(await token.unpauseAvailableAt()).to.equal(availableAt);
+    });
+
+    it("keeps the current policy resumable after a failed atomic replacement", async function () {
+      const { token, policy, admin, policyAuthority, pauser } = await deployFixture();
+      const alternate = await ethers.deployContract("MockCompliance", [policyAuthority.address]);
+      const alternateHash = ethers.keccak256(await ethers.provider.getCode(await alternate.getAddress()));
+      const originalHash = await token.complianceCodehash();
+      await token.connect(pauser).pause();
+      await expect(token.connect(policyAuthority).setCompliance(await alternate.getAddress(), originalHash))
+        .to.be.revertedWithCustomError(token, "InvalidCompliance");
+      expect(await token.compliance()).to.equal(await policy.getAddress());
+      expect(await token.complianceCodehash()).to.equal(originalHash);
+      await time.increaseTo(await token.unpauseAvailableAt());
+      await token.connect(admin).unpause();
+      expect(alternateHash).not.to.equal(originalHash);
+    });
+
+    it("rejects a replacement governed by a different authority", async function () {
+      const { token, policyAuthority, pauser, outsider } = await deployFixture();
+      const replacement = await ethers.deployContract("Compliance", [outsider.address]);
+      const replacementHash = ethers.keccak256(
+        await ethers.provider.getCode(await replacement.getAddress()),
+      );
+      await token.connect(pauser).pause();
+      await expect(
+        token.connect(policyAuthority).setCompliance(await replacement.getAddress(), replacementHash),
+      ).to.be.revertedWithCustomError(token, "InvalidPolicyAuthority");
     });
 
     it("replaces a refusing current policy without consulting it", async function () {
@@ -500,7 +548,12 @@ describe("PipoSecurityToken", function () {
         .withArgs(issuer.address);
 
       await token.connect(pauser).pause();
-      await expect(token.connect(policyAuthority).setCompliance(await replacement.getAddress()))
+      const replacementHash = ethers.keccak256(
+        await ethers.provider.getCode(await replacement.getAddress()),
+      );
+      await expect(
+        token.connect(policyAuthority).setCompliance(await replacement.getAddress(), replacementHash),
+      )
         .to.emit(token, "ComplianceUpdated")
         .withArgs(await policy.getAddress(), await replacement.getAddress());
       await time.increaseTo(await token.unpauseAvailableAt());

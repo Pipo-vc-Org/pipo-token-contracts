@@ -5,13 +5,18 @@ import {ICompliance} from "../interfaces/ICompliance.sol";
 
 /// @notice Valid alternate policy used to test explicit codehash approval.
 contract MockCompliance is ICompliance {
-    error Refused(address user, string reason);
-    error PolicyUnavailable();
-
+    address private immutable _POLICY_AUTHORITY;
     bool public refuseAll;
     mapping(address user => bool refused) public refused;
     bool public shouldRevert;
     string public reason = "Participant not permitted";
+
+    error Refused(address user, string reason);
+    error PolicyUnavailable();
+
+    constructor(address policyAuthority_) {
+        _POLICY_AUTHORITY = policyAuthority_;
+    }
 
     function setRefuseAll(bool value, string calldata reason_) external {
         refuseAll = value;
@@ -34,6 +39,10 @@ contract MockCompliance is ICompliance {
 
     function checkIsCompliant(address, address user) external view {
         _check(user);
+    }
+
+    function policyAuthority() external view returns (address) {
+        return _POLICY_AUTHORITY;
     }
 
     function _check(address user) private view {

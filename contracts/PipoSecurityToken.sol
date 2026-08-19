@@ -15,6 +15,11 @@ import {ICompliance} from "./interfaces/ICompliance.sol";
  *         administered terms, transfer compliance and aggregate lock-ups.
  */
 contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDefaultAdminRules {
+    struct Lockup {
+        uint256 amount;
+        uint64 releaseAt;
+    }
+
     bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
     bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
@@ -26,16 +31,11 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
     address public immutable ISSUANCE_AUTHORITY;
 
     ICompliance public compliance;
-    bytes32 public complianceCodehash;
-    mapping(address issuer => mapping(address recipient => uint256 remaining)) public mintAllowance;
     bool public mintEnabled = true;
     bool public burnEnabled = true;
     uint64 public unpauseAvailableAt;
-
-    struct Lockup {
-        uint256 amount;
-        uint64 releaseAt;
-    }
+    bytes32 public complianceCodehash;
+    mapping(address issuer => mapping(address recipient => uint256 remaining)) public mintAllowance;
 
     mapping(address holder => Lockup lockup) private _lockups;
 
@@ -66,7 +66,8 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
     error InvalidIssuanceAuthority();
     error InvalidMintRecipient();
     error InvalidCompliance();
-    error InvalidComplianceCodehash();
+    error ComplianceUnchanged();
+    error InvalidDefaultAdmin();
     error MintAllowanceExceeded(uint256 available);
     error MintAllowanceChanged(uint256 current);
     error MintDisabled();
@@ -108,21 +109,30 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
         if (bytes(symbol_).length == 0) revert EmptySymbol();
         if (bytes(identifier_).length == 0) revert EmptyIdentifier();
         if (bytes(termsUri_).length == 0) revert EmptyTermsUri();
-        if (issuer_ == address(0)) revert InvalidIssuer();
-        if (burner_ == address(0) || burner_ == issuer_) revert InvalidBurner();
-        if (pauser_ == address(0)) revert InvalidPauser();
-        if (policyAuthority_ == address(0) || policyAuthority_ == admin_) {
+        if (issuer_ == address(0) || issuer_ == admin_) revert InvalidIssuer();
+        if (burner_ == address(0) || burner_ == admin_ || burner_ == issuer_) {
+            revert InvalidBurner();
+        }
+        if (
+            pauser_ == address(0) || pauser_ == admin_ || pauser_ == issuer_
+                || pauser_ == burner_
+        ) revert InvalidPauser();
+        if (
+            policyAuthority_ == address(0) || policyAuthority_ == admin_
+                || policyAuthority_ == issuer_ || policyAuthority_ == burner_
+                || policyAuthority_ == pauser_
+        ) {
             revert InvalidPolicyAuthority();
         }
         if (
             issuanceAuthority_ == address(0) || issuanceAuthority_ == admin_
-                || issuanceAuthority_ == issuer_ || issuanceAuthority_ == policyAuthority_
+                || issuanceAuthority_ == issuer_ || issuanceAuthority_ == burner_
+                || issuanceAuthority_ == pauser_ || issuanceAuthority_ == policyAuthority_
         ) {
             revert InvalidIssuanceAuthority();
         }
         bytes32 bundledCodehash = keccak256(type(Compliance).runtimeCode);
-        _validateCompliance(compliance_, bundledCodehash);
-        if (Compliance(compliance_).defaultAdmin() != policyAuthority_) revert InvalidPolicyAuthority();
+        _validateCompliance(compliance_, bundledCodehash, policyAuthority_);
 
         compliance = ICompliance(compliance_);
         complianceCodehash = bundledCodehash;
@@ -182,22 +192,23 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
         emit BurnEnabledUpdated(enabled);
     }
 
-    /// @notice Replaces policy through independent compliance governance during a pause.
-    function setCompliance(address policy) external onlyPolicyAuthority whenPaused {
-        _validateCompliance(policy, complianceCodehash);
+    /// @notice Atomically approves and installs one governed policy during a pause.
+    function setCompliance(address policy, bytes32 expectedCodehash)
+        external
+        onlyPolicyAuthority
+        whenPaused
+    {
         address previousCompliance = address(compliance);
-        compliance = ICompliance(policy);
-        _scheduleUnpause();
-        emit ComplianceUpdated(previousCompliance, policy);
-    }
-
-    /// @notice Lets compliance governance approve one policy runtime before installation.
-    function setComplianceCodehash(bytes32 codehash) external onlyPolicyAuthority whenPaused {
-        if (codehash == bytes32(0)) revert InvalidComplianceCodehash();
         bytes32 previousCodehash = complianceCodehash;
-        complianceCodehash = codehash;
+        if (policy == previousCompliance && expectedCodehash == previousCodehash) {
+            revert ComplianceUnchanged();
+        }
+        _validateCompliance(policy, expectedCodehash, POLICY_AUTHORITY);
+        compliance = ICompliance(policy);
+        complianceCodehash = expectedCodehash;
         _scheduleUnpause();
-        emit ComplianceCodehashUpdated(previousCodehash, codehash);
+        emit ComplianceCodehashUpdated(previousCodehash, expectedCodehash);
+        emit ComplianceUpdated(previousCompliance, policy);
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {
@@ -208,7 +219,7 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
     function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         uint64 availableAt = unpauseAvailableAt;
         if (block.timestamp < availableAt) revert UnpauseCooldown(availableAt);
-        _validateCompliance(address(compliance), complianceCodehash);
+        _validateCompliance(address(compliance), complianceCodehash, POLICY_AUTHORITY);
         unpauseAvailableAt = 0;
         _unpause();
     }
@@ -251,16 +262,24 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
         emit LockupSet(holder, amount, releaseAt);
     }
 
+    function availableBalanceOf(address holder) external view returns (uint256) {
+        return _available(balanceOf(holder), lockedBalanceOf(holder));
+    }
+
+    /// @notice Schedules only a non-zero successor; this token must remain administered.
+    function beginDefaultAdminTransfer(address newAdmin)
+        public
+        override
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (newAdmin == address(0)) revert InvalidDefaultAdmin();
+        _beginDefaultAdminTransfer(newAdmin);
+    }
+
     function lockedBalanceOf(address holder) public view returns (uint256) {
         Lockup storage lockup = _lockups[holder];
         if (lockup.releaseAt <= block.timestamp) return 0;
         return lockup.amount;
-    }
-
-    function availableBalanceOf(address holder) public view returns (uint256) {
-        uint256 balance = balanceOf(holder);
-        uint256 locked = lockedBalanceOf(holder);
-        return balance > locked ? balance - locked : 0;
     }
 
     function _update(address from, address to, uint256 value) internal override(ERC20, ERC20Pausable) {
@@ -271,11 +290,12 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
         if (from != address(0)) {
             uint256 locked = lockedBalanceOf(from);
             if (locked != 0) {
-                uint256 balance = balanceOf(from);
-                uint256 available = balance > locked ? balance - locked : 0;
+                uint256 available = _available(balanceOf(from), locked);
                 if (value > available) revert LockedBalance(locked);
             }
         }
+        // The pause check is intentionally lifted above the external policy call.
+        // Call ERC20 directly so ERC20Pausable does not repeat it afterwards.
         ERC20._update(from, to, value);
     }
 
@@ -285,9 +305,21 @@ contract PipoSecurityToken is ERC20, ERC20Permit, ERC20Pausable, AccessControlDe
         emit UnpauseScheduled(availableAt);
     }
 
-    function _validateCompliance(address policy, bytes32 expectedCodehash) private view {
+    function _validateCompliance(address policy, bytes32 expectedCodehash, address expectedAuthority)
+        private
+        view
+    {
         if (policy == address(0) || policy.code.length == 0 || policy.codehash != expectedCodehash) {
             revert InvalidCompliance();
         }
+        (bool success, bytes memory result) = policy.staticcall(
+            abi.encodeCall(ICompliance.policyAuthority, ())
+        );
+        if (!success || result.length != 32) revert InvalidCompliance();
+        if (abi.decode(result, (address)) != expectedAuthority) revert InvalidPolicyAuthority();
+    }
+
+    function _available(uint256 balance, uint256 locked) private pure returns (uint256) {
+        return balance > locked ? balance - locked : 0;
     }
 }

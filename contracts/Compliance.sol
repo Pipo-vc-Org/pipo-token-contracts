@@ -22,6 +22,7 @@ import {ICompliance} from "./interfaces/ICompliance.sol";
  */
 contract Compliance is ICompliance, AccessControlDefaultAdminRules {
     uint256 public constant MAX_BATCH_SIZE = 200;
+    uint64 public constant MAX_OPS_FREEZE_DURATION = 7 days;
 
     /// @notice Compliance officers.
     bytes32 public constant COMPLIANCE_ROLE = keccak256("COMPLIANCE_ROLE");
@@ -52,6 +53,9 @@ contract Compliance is ICompliance, AccessControlDefaultAdminRules {
     error BatchTooLarge(uint256 length);
     error ZeroAddress();
     error FreezeInPast();
+    error FreezeTooLong(uint64 maximumUntil);
+    error UnexpectedSanctionEpoch(uint256 expected, uint256 actual);
+    error InvalidDefaultAdmin();
     error UnauthorizedComplianceOperator(address account);
 
     modifier onlyComplianceOfficer() {
@@ -74,49 +78,13 @@ contract Compliance is ICompliance, AccessControlDefaultAdminRules {
         _sanctionEpoch = 1;
     }
 
-    // ── Checks ────────────────────────────────────────────────────────────────
-
-    /// @inheritdoc ICompliance
-    function checkIsCompliant(address token, address user) external view {
-        _check(token, user);
-    }
-
-    /// @inheritdoc ICompliance
-    function checkTransfer(address token, address operator, address from, address to, uint256)
-        external
-        view
-    {
-        if (operator != address(0)) _check(token, operator);
-        if (from != address(0) && from != operator) _check(token, from);
-        if (to != address(0) && to != operator && to != from) _check(token, to);
-    }
-
-    /// @notice Non-reverting form, for callers that need a flag rather than a
-    ///         revert — a UI deciding whether to offer a transfer, for instance.
-    function isCompliant(address token, address user) external view returns (bool) {
-        if (blockedAddresses[token][user] || blockedAddresses[address(0)][user]) return false;
-        if (_sanctionedInEpoch[user] == _sanctionEpoch) return false;
-        return _freezeExpiry(token, user) <= block.timestamp;
-    }
-
-    function isSanctioned(address user) external view returns (bool) {
-        return _sanctionedInEpoch[user] == _sanctionEpoch;
-    }
-
-    function sanctionEpoch() external view returns (uint256) {
-        return _sanctionEpoch;
-    }
-
     // ── Blocklist ─────────────────────────────────────────────────────────────
 
-    /// @notice Token operators may impose blocks; only compliance officers may lift them.
+    /// @notice Permanent blocks are reserved for compliance officers.
     function setBlocked(address token, address[] calldata accounts, bool blocked)
         external
-        onlyOperatorFor(token)
+        onlyComplianceOfficer
     {
-        if (!blocked && !_isComplianceOfficer(_msgSender())) {
-            revert UnauthorizedComplianceOperator(_msgSender());
-        }
         _validateBatch(accounts);
 
         for (uint256 i = 0; i < accounts.length; ++i) {
@@ -158,9 +126,14 @@ contract Compliance is ICompliance, AccessControlDefaultAdminRules {
         emit SanctionsReset(epoch);
     }
 
-    /// @notice Replaces the list wholesale: a fresh epoch retires all previous
-    ///         entries, then `accounts` are written into it. Duplicates are harmless.
-    function setSanctions(address[] calldata accounts) external onlyComplianceOfficer {
+    /// @notice Replaces the list wholesale if the caller observed the current epoch.
+    function replaceSanctions(uint256 expectedEpoch, address[] calldata accounts)
+        external
+        onlyComplianceOfficer
+    {
+        if (expectedEpoch != _sanctionEpoch) {
+            revert UnexpectedSanctionEpoch(expectedEpoch, _sanctionEpoch);
+        }
         _validateBatch(accounts);
         uint256 epoch = ++_sanctionEpoch;
 
@@ -175,20 +148,70 @@ contract Compliance is ICompliance, AccessControlDefaultAdminRules {
     // ── Freezes ───────────────────────────────────────────────────────────────
 
     /// @notice Freezes `account` for `token` until `until`. Token operators may
-    ///         impose or extend; only compliance officers may shorten or lift.
+    ///         impose or extend for at most seven days; only compliance officers
+    ///         may set longer freezes, shorten, lift, or act globally.
     ///         Pass `token == address(0)` for global scope and `until == 0` to lift.
     function setFreeze(address token, address account, uint64 until) external onlyOperatorFor(token) {
         if (account == address(0)) revert ZeroAddress();
         if (until != 0 && until <= block.timestamp) revert FreezeInPast();
-        if (
-            !_isComplianceOfficer(_msgSender())
-                && (until == 0 || until < frozenUntil[token][account])
-        ) {
-            revert UnauthorizedComplianceOperator(_msgSender());
+        if (!_isComplianceOfficer(_msgSender())) {
+            if (until == 0 || until < frozenUntil[token][account]) {
+                revert UnauthorizedComplianceOperator(_msgSender());
+            }
+            uint64 maximumUntil = uint64(block.timestamp + MAX_OPS_FREEZE_DURATION);
+            if (until > maximumUntil) revert FreezeTooLong(maximumUntil);
         }
 
         frozenUntil[token][account] = until;
         emit FreezeSet(token, account, until);
+    }
+
+    // ── Checks ────────────────────────────────────────────────────────────────
+
+    /// @inheritdoc ICompliance
+    function policyAuthority() external view returns (address) {
+        return defaultAdmin();
+    }
+
+    /// @inheritdoc ICompliance
+    function checkIsCompliant(address token, address user) external view {
+        _check(token, user);
+    }
+
+    /// @inheritdoc ICompliance
+    function checkTransfer(address token, address operator, address from, address to, uint256)
+        external
+        view
+    {
+        if (operator != address(0)) _check(token, operator);
+        if (from != address(0) && from != operator) _check(token, from);
+        if (to != address(0) && to != operator && to != from) _check(token, to);
+    }
+
+    /// @notice Non-reverting form, for callers that need a flag rather than a
+    ///         revert — a UI deciding whether to offer a transfer, for instance.
+    function isCompliant(address token, address user) external view returns (bool) {
+        if (blockedAddresses[token][user] || blockedAddresses[address(0)][user]) return false;
+        if (_sanctionedInEpoch[user] == _sanctionEpoch) return false;
+        return _freezeExpiry(token, user) <= block.timestamp;
+    }
+
+    function isSanctioned(address user) external view returns (bool) {
+        return _sanctionedInEpoch[user] == _sanctionEpoch;
+    }
+
+    function sanctionEpoch() external view returns (uint256) {
+        return _sanctionEpoch;
+    }
+
+    /// @notice Schedules only a non-zero successor; this policy must remain administered.
+    function beginDefaultAdminTransfer(address newAdmin)
+        public
+        override
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (newAdmin == address(0)) revert InvalidDefaultAdmin();
+        _beginDefaultAdminTransfer(newAdmin);
     }
 
     function opsRole(address token) public pure returns (bytes32) {
